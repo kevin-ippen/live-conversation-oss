@@ -107,9 +107,89 @@ def test_has_active_connection_true_when_connected():
 # ── register_voice_handler ────────────────────────────────────────────────────
 
 def test_register_voice_handler_stores_callable():
-    async def my_handler(pcm, cancel):
+    async def my_handler(pcm, cancel, turn_id):
         return {}
 
-    server.register_voice_handler(my_handler)
+    import asyncio
+    loop = asyncio.new_event_loop()
+    server.register_voice_handler(my_handler, loop)
     assert server._voice_handler is my_handler
+    assert server._main_loop is loop
     server._voice_handler = None  # cleanup
+    server._main_loop = None
+    loop.close()
+
+
+# ── set_session_state ─────────────────────────────────────────────────────────
+
+def test_set_session_state_active():
+    server.set_session_state(active=True, session_id="abc123")
+    assert server._session_active is True
+    assert server._session_id == "abc123"
+    server.set_session_state(active=False, session_id=None)
+
+
+def test_set_session_state_inactive():
+    server.set_session_state(active=False, session_id=None)
+    assert server._session_active is False
+    assert server._session_id is None
+
+
+# ── push_session_event ────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_push_session_event_stamps_session_id():
+    server._session_id = "sess-abc"
+    server._loop = asyncio.get_running_loop()
+    q: asyncio.Queue = asyncio.Queue()
+    server._connections.append(q)
+
+    server.push_session_event("orb", {"state": "listening"})
+    await asyncio.sleep(0)
+
+    msg = q.get_nowait()
+    assert msg["data"]["session_id"] == "sess-abc"
+    server._session_id = None
+
+
+@pytest.mark.asyncio
+async def test_push_session_event_no_session_id_no_stamp():
+    server._session_id = None
+    server._loop = asyncio.get_running_loop()
+    q: asyncio.Queue = asyncio.Queue()
+    server._connections.append(q)
+
+    server.push_session_event("orb", {"state": "idle"})
+    await asyncio.sleep(0)
+
+    msg = q.get_nowait()
+    assert "session_id" not in msg["data"]
+
+
+# ── Double start_session guard ────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_session_start_endpoint_rejects_when_active():
+    from fastapi.testclient import TestClient
+    server.set_session_state(active=True, session_id="existing")
+
+    client = TestClient(server.app)
+    resp = client.post("/session/start")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is False
+    assert body["reason"] == "already_active"
+
+    server.set_session_state(active=False, session_id=None)
+
+
+@pytest.mark.asyncio
+async def test_session_start_endpoint_ok_when_inactive():
+    from fastapi.testclient import TestClient
+    server.set_session_state(active=False, session_id=None)
+    server._loop = asyncio.get_running_loop()
+
+    client = TestClient(server.app)
+    resp = client.post("/session/start")
+    assert resp.status_code == 200
+    assert resp.json()["ok"] is True

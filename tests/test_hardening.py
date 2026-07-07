@@ -37,6 +37,9 @@ def _reset_server():
     server._connections.clear()
     server._greeting_queue.clear()
     server._active_runtime = None
+    server._session_active = False
+    server._session_id     = None
+    server._main_loop      = None
     while not server._command_queue.empty():
         try:
             server._command_queue.get_nowait()
