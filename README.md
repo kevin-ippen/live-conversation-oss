@@ -3,6 +3,16 @@
 A provider-agnostic, self-hosted real-time voice conversation framework.
 Drop in any ASR, TTS, or LLM — the framework handles mic capture, VAD, transport, and audio playback.
 
+> **Scope / limitations**
+> This is a **local, single-user, turn-based** runtime.
+> - Designed for one active session at a time on localhost.
+> - Turn-based: audio is streamed to the server only after end-of-speech is detected in the browser; the server transcribes, calls your handler, synthesizes, and replies before accepting the next turn.
+> - Not a full-duplex streaming pipeline (no Realtime API / WebRTC).
+> - No auth, no multi-user support, no production deployment story yet.
+>
+> Good for: local voice agents, prototypes, internal tools, demos.
+> Not (yet) for: multi-user apps, low-latency streaming, public deployments.
+
 ---
 
 ## Architecture
@@ -33,10 +43,12 @@ No audio is ever streamed to the server until end-of-speech is detected.
 
 ## Quick start
 
+> **PyPI package coming soon.** Install directly from GitHub for now:
+
 ```bash
-pip install liveconv
+pip install git+https://github.com/kevin-ippen/live-conversation-oss.git
 # or for OpenAI support:
-pip install "liveconv[openai]"
+pip install "git+https://github.com/kevin-ippen/live-conversation-oss.git#egg=liveconv[openai]"
 ```
 
 ### Echo example (zero API keys)
