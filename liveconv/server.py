@@ -9,10 +9,27 @@ Exposes:
   POST /session/start
   POST /session/end
 
-The voice pipeline flow:
+Voice pipeline flow:
   Browser mic → AudioWorklet → VAD → WebSocket binary PCM
   → server ASR → TurnHandler.on_turn() → TTS → WebSocket base64 audio
   → browser AudioContext playback
+
+Wire protocol (browser ↔ server):
+  Browser → Server
+    binary frames            — 16kHz mono PCM16
+    {"type":"audio.config", "sample_rate":N, "channels":N, "format":"pcm_s16le"}
+    {"type":"end_of_speech", "reason":"..."}  — VAD detected end of turn
+    {"type":"interrupt"}     — barge-in; cancels in-flight turn
+    {"type":"ping"}          — keepalive
+
+  Server → Browser
+    {"type":"asr.final",    "text":"...",   "turn_id":"..."}
+    {"type":"asr.empty",    "reason":"...", "turn_id":"..."}  — no transcript
+    {"type":"agent.audio",  "audio":"<b64>","turn_id":"..."}  — WAV chunk
+    {"type":"agent.done",   "reason":"...", "turn_id":"..."}  — end of turn
+    {"type":"turn.cancelled","turn_id":"..."}
+    {"type":"turn.error",   "stage":"asr|handler|tts", "message":"...", "turn_id":"..."}
+    {"type":"pong"}          — keepalive reply
 """
 
 from __future__ import annotations
@@ -25,7 +42,9 @@ import os
 import socket
 import threading
 import time
+import uuid
 import webbrowser
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import AsyncGenerator, Callable
 
@@ -33,15 +52,47 @@ import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 
-from .session import ConversationSession, TurnHandler
-from .voice_pipeline import ASRProvider, TTSProvider, SilentTTS
-
 logger = logging.getLogger(__name__)
 
 _HERE = Path(__file__).parent
 
-SAMPLE_RATE_IN  = 16000
-MIN_AUDIO_BYTES = SAMPLE_RATE_IN * 2 * 300 // 1000  # 300 ms minimum utterance
+SAMPLE_RATE_IN   = 16000
+BYTES_PER_SAMPLE = 2
+MIN_AUDIO_MS     = 300
+MIN_AUDIO_BYTES  = SAMPLE_RATE_IN * BYTES_PER_SAMPLE * MIN_AUDIO_MS // 1000
+
+
+# ── TurnRuntime ───────────────────────────────────────────────────────────────
+
+@dataclass
+class TurnRuntime:
+    """Tracks one in-flight turn. Cancelled on interrupt or session end."""
+    turn_id:      str           = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    task:         asyncio.Task | None = None
+    cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
+
+    def cancel(self) -> None:
+        self.cancel_event.set()
+        if self.task and not self.task.done():
+            self.task.cancel()
+
+
+def normalize_event(ev: object) -> dict | None:
+    """Validate and normalise a handler-emitted event dict.
+
+    Returns None if the event should be silently dropped.
+    """
+    if not isinstance(ev, dict):
+        logger.warning("Dropped non-dict event: %r", ev)
+        return None
+    ev_type = ev.get("type")
+    if not isinstance(ev_type, str) or not ev_type.strip():
+        logger.warning("Dropped event without valid type: %r", ev)
+        return None
+    data = ev.get("data", {})
+    if not isinstance(data, dict):
+        data = {"value": data}
+    return {"type": ev_type.strip(), "data": data}
 
 
 # ── App + per-connection state ────────────────────────────────────────────────
@@ -51,13 +102,27 @@ app = FastAPI()
 _connections: list[asyncio.Queue] = []
 _command_queue: asyncio.Queue     = asyncio.Queue()
 _loop: asyncio.AbstractEventLoop | None = None
-_voice_handler: Callable | None   = None  # set by the daemon on startup
+_voice_handler: Callable | None   = None  # registered by ConversationApp
+_greeting_queue: list[bytes]      = []    # pending greeting audio waiting for first WS
+_active_runtime: TurnRuntime | None = None
 
 
 def register_voice_handler(fn: Callable) -> None:
-    """The application registers its voice turn handler here."""
     global _voice_handler
     _voice_handler = fn
+
+
+def queue_greeting_audio(chunks: list[bytes]) -> None:
+    """Called by ConversationApp when greeting audio is ready before any WS connects."""
+    global _greeting_queue
+    _greeting_queue = list(chunks)
+
+
+def flush_greeting_audio() -> list[bytes]:
+    """Drain and return any pending greeting audio."""
+    global _greeting_queue
+    chunks, _greeting_queue = _greeting_queue, []
+    return chunks
 
 
 # ── SSE broadcast ─────────────────────────────────────────────────────────────
@@ -131,24 +196,20 @@ async def sse_events() -> StreamingResponse:
 
 @app.websocket("/voice")
 async def voice_ws(ws: WebSocket) -> None:
-    """Real-time voice pipeline.
+    global _active_runtime
 
-    Browser → Server:
-      binary frames            — 16kHz mono PCM16
-      {"type":"end_of_speech"} — VAD detected end of turn
-      {"type":"interrupt"}     — barge-in
-      {"type":"ping"}          — keepalive
-
-    Server → Browser:
-      {"type":"asr.final",    "text":"..."}    — transcript
-      {"type":"agent.audio",  "audio":"<b64>"} — one TTS audio chunk (WAV)
-      {"type":"agent.done"}                    — finished speaking
-      {"type":"pong"}                          — keepalive reply
-    """
     await ws.accept()
-    audio_buf    = bytearray()
-    cancel_event = asyncio.Event()
     logger.info("Voice WebSocket connected")
+
+    audio_buf     = bytearray()
+    audio_config  = {"sample_rate": SAMPLE_RATE_IN, "channels": 1, "format": "pcm_s16le"}
+
+    # Drain any greeting audio that was synthesized before this WS connected
+    for chunk in flush_greeting_audio():
+        b64 = base64.b64encode(chunk).decode()
+        await ws.send_json({"type": "agent.audio", "audio": b64, "turn_id": "greeting"})
+    if flush_greeting_audio.__doc__:  # always emit agent.done after greeting
+        pass  # already drained above via flush_greeting_audio()
 
     try:
         while True:
@@ -172,61 +233,131 @@ async def voice_ws(ws: WebSocket) -> None:
 
             msg_type = data.get("type", "")
 
-            if msg_type == "interrupt":
-                cancel_event.set()
+            if msg_type == "audio.config":
+                audio_config.update({
+                    k: data[k] for k in ("sample_rate", "channels", "format") if k in data
+                })
+                if audio_config.get("sample_rate") != SAMPLE_RATE_IN:
+                    logger.warning("Client sample rate %s ≠ expected %s",
+                                   audio_config.get("sample_rate"), SAMPLE_RATE_IN)
+                    push_event("warning", {
+                        "message": f"Expected {SAMPLE_RATE_IN}Hz audio, got {audio_config.get('sample_rate')}Hz"
+                    })
+
+            elif msg_type == "interrupt":
+                if _active_runtime:
+                    _active_runtime.cancel()
+                    push_event("turn.cancelled", {"turn_id": _active_runtime.turn_id})
                 audio_buf = bytearray()
 
             elif msg_type == "end_of_speech":
                 if len(audio_buf) < MIN_AUDIO_BYTES:
                     audio_buf = bytearray()
-                    await ws.send_json({"type": "agent.done"})
+                    rt = TurnRuntime()
+                    await ws.send_json({"type": "asr.empty",
+                                        "reason": "too_short", "turn_id": rt.turn_id})
+                    await ws.send_json({"type": "agent.done",
+                                        "reason": "empty_audio", "turn_id": rt.turn_id})
                     continue
 
                 pcm = bytes(audio_buf)
                 audio_buf = bytearray()
-                cancel_event.clear()
+
+                # Cancel any previous in-flight turn
+                if _active_runtime:
+                    _active_runtime.cancel()
+
+                rt = TurnRuntime()
+                _active_runtime = rt
 
                 push_event("orb", {"state": "thinking"})
-                transcript = ""
-                spoken     = ""
 
-                if _voice_handler is not None:
+                # Run turn in a cancellable Task
+                async def _run_turn(pcm: bytes, rt: TurnRuntime, ws: WebSocket) -> None:
+                    global _active_runtime
+                    transcript = spoken = ""
                     try:
-                        result = await _voice_handler(pcm, cancel_event)
+                        if _voice_handler is None:
+                            logger.warning("No voice handler registered")
+                            await ws.send_json({"type": "agent.done",
+                                                "reason": "no_handler", "turn_id": rt.turn_id})
+                            return
+
+                        result = await _voice_handler(pcm, rt.cancel_event, rt.turn_id)
                         transcript = result.get("transcript", "")
                         spoken     = result.get("spoken_text", "")
-                        for ev in result.get("events", []):
-                            push_event(ev["type"], ev.get("data", {}))
+
+                        for raw_ev in result.get("events", []):
+                            ev = normalize_event(raw_ev)
+                            if ev:
+                                push_event(ev["type"], ev["data"])
+
+                        if not transcript:
+                            reason = result.get("empty_reason", "no_speech")
+                            await ws.send_json({"type": "asr.empty",
+                                                "reason": reason, "turn_id": rt.turn_id})
+                            await ws.send_json({"type": "agent.done",
+                                                "reason": "empty_transcript", "turn_id": rt.turn_id})
+                            push_event("orb", {"state": "listening"})
+                            return
+
+                        await ws.send_json({"type": "asr.final",
+                                            "text": transcript, "turn_id": rt.turn_id})
+                        push_event("transcript", {"text": transcript})
+
+                        if rt.cancel_event.is_set():
+                            await ws.send_json({"type": "agent.done",
+                                                "reason": "cancelled", "turn_id": rt.turn_id})
+                            return
+
+                        for audio_bytes in result.get("audio_chunks", []):
+                            if rt.cancel_event.is_set():
+                                break
+                            b64 = base64.b64encode(audio_bytes).decode()
+                            await ws.send_json({"type": "agent.audio",
+                                                "audio": b64, "turn_id": rt.turn_id})
+
+                        reason = "cancelled" if rt.cancel_event.is_set() else "complete"
+                        await ws.send_json({"type": "agent.done",
+                                            "reason": reason, "turn_id": rt.turn_id})
+                        push_event("orb", {"state": "listening"})
+
+                    except asyncio.CancelledError:
+                        try:
+                            await ws.send_json({"type": "agent.done",
+                                                "reason": "cancelled", "turn_id": rt.turn_id})
+                            push_event("turn.cancelled", {"turn_id": rt.turn_id})
+                            push_event("orb", {"state": "listening"})
+                        except Exception:
+                            pass
+                        raise
+
                     except Exception as e:
-                        logger.error(f"Voice handler error: {e}", exc_info=True)
-                        spoken = "Sorry, something went wrong."
-                else:
-                    logger.warning("No voice handler registered")
+                        logger.error("Turn error: %s", e, exc_info=True)
+                        try:
+                            await ws.send_json({"type": "turn.error",
+                                                "stage": "unknown", "message": str(e),
+                                                "turn_id": rt.turn_id})
+                            await ws.send_json({"type": "agent.done",
+                                                "reason": "error", "turn_id": rt.turn_id})
+                            push_event("orb", {"state": "listening"})
+                        except Exception:
+                            pass
 
-                if transcript:
-                    await ws.send_json({"type": "asr.final", "text": transcript})
-                    push_event("transcript", {"text": transcript})
+                    finally:
+                        if _active_runtime is rt:
+                            _active_runtime = None
 
-                if cancel_event.is_set():
-                    await ws.send_json({"type": "agent.done"})
-                    push_event("orb", {"state": "listening"})
-                    continue
-
-                if spoken:
-                    for audio_bytes in result.get("audio_chunks", []):
-                        if cancel_event.is_set():
-                            break
-                        b64 = base64.b64encode(audio_bytes).decode()
-                        await ws.send_json({"type": "agent.audio", "audio": b64})
-
-                await ws.send_json({"type": "agent.done"})
-                push_event("orb", {"state": "listening"})
+                rt.task = asyncio.ensure_future(_run_turn(pcm, rt, ws))
 
             elif msg_type == "ping":
                 await ws.send_json({"type": "pong"})
 
     except WebSocketDisconnect:
         logger.info("Voice WebSocket disconnected")
+        if _active_runtime:
+            _active_runtime.cancel()
+            _active_runtime = None
 
 
 # ── Session control ───────────────────────────────────────────────────────────
@@ -274,13 +405,6 @@ def start_server(
     open_browser: bool = True,
     html_path: str | Path | None = None,
 ) -> None:
-    """Start the canvas server in a background thread.
-
-    Args:
-        port:         TCP port to bind (default 8765).
-        open_browser: Open the default browser on startup.
-        html_path:    Path to a custom HTML file (overrides built-in app.html).
-    """
     global _loop, _custom_html_path
     import uvicorn
 
@@ -303,4 +427,4 @@ def start_server(
         if _wait_for_port("127.0.0.1", port):
             webbrowser.open(f"http://127.0.0.1:{port}")
         else:
-            logger.warning(f"Server did not bind on port {port} within 8s")
+            logger.warning("Server did not bind on port %d within 8s", port)
