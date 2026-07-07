@@ -3,41 +3,51 @@
 A provider-agnostic, self-hosted real-time voice conversation framework.
 Drop in any ASR, TTS, or LLM — the framework handles mic capture, VAD, transport, and audio playback.
 
-> **Scope / limitations**
-> This is a **local, single-user, turn-based** runtime.
-> - Designed for one active session at a time on localhost.
-> - Turn-based: audio is streamed to the server only after end-of-speech is detected in the browser; the server transcribes, calls your handler, synthesizes, and replies before accepting the next turn.
-> - Not a full-duplex streaming pipeline (no Realtime API / WebRTC).
-> - No auth, no multi-user support, no production deployment story yet.
+> **Scope — read before using**
 >
-> Good for: local voice agents, prototypes, internal tools, demos.
-> Not (yet) for: multi-user apps, low-latency streaming, public deployments.
+> | What it is | What it is not |
+> |---|---|
+> | Local, single-user runtime | Multi-user server |
+> | Turn-based voice loop | Full-duplex / Realtime API |
+> | One active session at a time | Concurrent sessions |
+> | Localhost canvas | Public deployment target |
+> | Provider swap-in framework | Auth / access control |
+>
+> Good for: local voice agents, internal tools, demos, prototypes.
+> Not (yet) for: multi-tenant apps, sub-100ms latency, public endpoints.
 
 ---
 
 ## Architecture
 
 ```
-Browser                              Python server
-───────────────────────────────────  ──────────────────────────────────
-AudioWorklet (pcm-processor.js)
-  ↓ 20ms PCM chunks
-Silero VAD (vad_core.js, ONNX)   →  WebSocket /voice
-  ↓ end_of_speech event              ↓
-                                   ASRProvider.transcribe(pcm)
-                                     ↓
-                                   TurnHandler.on_turn(transcript, session)
-                                     ↓
-                                   TTSProvider.synthesize(text)
-                                     ↓
-                                   base64 WAV chunks →
-AudioContext playback              ←  WebSocket agent.audio
-
-SSE /events  ← ─ ─ ─ ─ ─ ─ ─ ─ ─ push_event() — orb state, transcripts
+╔══════════════════════════════════╗       ╔══════════════════════════════════════╗
+║           BROWSER                ║       ║           PYTHON SERVER              ║
+╟──────────────────────────────────╢       ╟──────────────────────────────────────╢
+║                                  ║       ║                                      ║
+║  Mic → AudioWorklet              ║       ║  FastAPI                             ║
+║        (pcm-processor.js)        ║       ║                                      ║
+║           │ 20ms PCM chunks      ║       ║  ┌─────────────────────────────────┐ ║
+║           ▼                      ║       ║  │  WebSocket /voice               │ ║
+║  Silero VAD                      ║       ║  │                                 │ ║
+║  (vad_core.js, ONNX Runtime Web) ║       ║  │  binary PCM frames ──────────▶ │ ║
+║           │ end_of_speech + PCM  ║──WS──▶║  │                                 │ ║
+║           │                      ║       ║  │  ASRProvider.transcribe()       │ ║
+║           │                      ║       ║  │         │                       │ ║
+║           │                      ║       ║  │  TurnHandler.on_turn()          │ ║
+║           │                      ║       ║  │         │ TurnResult            │ ║
+║           │                      ║       ║  │  TTSProvider.synthesize()       │ ║
+║           │                      ║       ║  │         │ base64 WAV            │ ║
+║  AudioContext playback ◀─────────║──WS───║  │  agent.audio ◀─────────────── │ ║
+║                                  ║       ║  └─────────────────────────────────┘ ║
+║  SSE event bus ◀─────────────────║──SSE──║  push_event() — orb/transcript/      ║
+║  (orb state, transcripts,        ║       ║  custom TurnResult.events            ║
+║   tool_call, tool_result, ...)   ║       ║                                      ║
+╚══════════════════════════════════╝       ╚══════════════════════════════════════╝
 ```
 
-**VAD** runs entirely in the browser via [Silero VAD v5 ONNX](https://github.com/ricky0123/vad-web) loaded from jsDelivr CDN.
-No audio is ever streamed to the server until end-of-speech is detected.
+**VAD runs entirely in the browser** via [Silero VAD v5](https://github.com/ricky0123/vad-web) (ONNX Runtime Web, loaded from jsDelivr CDN).
+Audio is only sent to the server after end-of-speech is detected — no streaming of silence or partial audio.
 
 ---
 
@@ -76,6 +86,20 @@ Open [http://localhost:8765](http://localhost:8765), click **Start**, and speak.
 export OPENAI_API_KEY=sk-...
 python examples/openai_chat/main.py
 ```
+
+### Agent with tools (the interesting one)
+
+A GPT-4o agent that calls tools during a turn and pushes live events to the browser
+(`thinking`, `tool_call`, `tool_result`, `final`) into a split-pane canvas.
+
+```bash
+export OPENAI_API_KEY=sk-...
+python examples/agent_with_tools/main.py
+```
+
+Try: *"What's the weather in Tokyo?"*, *"What is 137 times 42?"*, *"Look up a fact about voice."*
+
+See [examples/agent_with_tools/README.md](examples/agent_with_tools/README.md) for details on swapping in real tools.
 
 ---
 
