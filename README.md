@@ -80,6 +80,17 @@ liveconv.ConversationApp(
 
 Open [http://localhost:8765](http://localhost:8765), click **Start**, and speak.
 
+### Databricks example (Parakeet ASR + Kokoro TTS)
+
+```bash
+export DATABRICKS_HOST=https://<your-workspace>.azuredatabricks.net
+export DATABRICKS_TOKEN=<your-pat>
+python examples/databricks_chat/main.py
+```
+
+Talks to your own Databricks Model Serving endpoints — no external API keys needed.
+Override endpoint names via `LIVECONV_ASR_ENDPOINT`, `LIVECONV_TTS_ENDPOINT`, `LIVECONV_LLM_ENDPOINT`.
+
 ### GPT-4o example
 
 ```bash
@@ -182,10 +193,38 @@ See [liveconv/app.html](liveconv/app.html) for the reference implementation.
 
 | Class | Type | Notes |
 |-------|------|-------|
+| `DatabricksASR` | ASR | Any Databricks Model Serving endpoint (e.g. Parakeet TDT). Reads `DATABRICKS_HOST` + `DATABRICKS_TOKEN`. |
+| `DatabricksTTS` | TTS | Any Databricks Model Serving endpoint (e.g. Kokoro TTS). Sentence-level parallel synthesis. |
 | `WhisperASR` | ASR | OpenAI Whisper-1 via `openai` SDK. Requires `pip install openai`. |
 | `OpenAITTS` | TTS | OpenAI tts-1 / tts-1-hd. Voices: alloy, echo, fable, onyx, nova, shimmer. |
 | `EchoASR` | ASR | Returns a fixed string. No API call. Useful for testing. |
 | `SilentTTS` | TTS | Returns empty audio. No API call. Useful for text-only sessions. |
+
+### DatabricksASR / DatabricksTTS
+
+```python
+from liveconv.voice_pipeline import DatabricksASR, DatabricksTTS
+
+liveconv.ConversationApp(
+    handler = MyHandler(),
+    asr     = DatabricksASR(
+                  endpoint="parakeet-tdt-asr-endpoint",  # default
+                  # host and token read from DATABRICKS_HOST / DATABRICKS_TOKEN
+              ),
+    tts     = DatabricksTTS(
+                  endpoint="kokoro-tts",    # default
+                  speaker="am_michael",     # default
+              ),
+).run()
+```
+
+Expected endpoint contract:
+
+**ASR** — input: `{"inputs": [{"audio_b64": "<base64-WAV>", "language": "en"}]}`
+— output: `{"predictions": [{"text": "<transcript>"}]}`
+
+**TTS** — input: `{"inputs": [{"text": "...", "speaker": "am_michael", "language": "en", "instruct": ""}]}`
+— output: `{"predictions": [{"audio_b64": "<base64-WAV>"}]}`
 
 ---
 
