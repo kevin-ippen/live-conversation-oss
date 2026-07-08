@@ -6,6 +6,8 @@ Provides:
   - Built-in providers:
       WhisperASR          openai.Audio.transcriptions  (requires openai)
       OpenAITTS           openai.Audio.speech          (requires openai)
+      DatabricksASR       Databricks Model Serving endpoint (e.g. Parakeet TDT)
+      DatabricksTTS       Databricks Model Serving endpoint (e.g. Kokoro TTS)
       EchoASR             returns the literal bytes as hex — useful for smoke tests
       SilentTTS           returns empty audio — useful for text-only sessions
 """
@@ -146,6 +148,165 @@ class OpenAITTS(TTSProvider):
         except Exception as e:
             logger.error(f"OpenAITTS error: {e}")
             return []
+
+
+# ── Built-in: Databricks Model Serving ASR ───────────────────────────────────
+
+class DatabricksASR(ASRProvider):
+    """ASR via a Databricks Model Serving endpoint (e.g. Parakeet TDT).
+
+    The endpoint must accept::
+
+        {"inputs": [{"audio_b64": "<base64-WAV>", "language": "en"}]}
+
+    and return::
+
+        {"predictions": [{"text": "<transcript>"}]}
+
+    Args:
+        endpoint:     Serving endpoint name, e.g. ``"parakeet-tdt-asr-endpoint"``.
+        host:         Databricks workspace URL. Reads ``DATABRICKS_HOST`` if omitted.
+        token:        Personal access token. Reads ``DATABRICKS_TOKEN`` if omitted.
+                      When running inside a Databricks App, leave both as ``None`` —
+                      the runtime injects ``DATABRICKS_CLIENT_ID`` / ``DATABRICKS_CLIENT_SECRET``
+                      and the SDK resolves auth automatically via ``httpx`` + OAuth M2M.
+        language:     BCP-47 language hint forwarded to the endpoint.
+        timeout:      HTTP timeout in seconds.
+    """
+
+    def __init__(
+        self,
+        endpoint: str = "parakeet-tdt-asr-endpoint",
+        host: str | None = None,
+        token: str | None = None,
+        language: str = "en",
+        timeout: float = 20.0,
+    ):
+        self._endpoint = endpoint
+        self._host     = host
+        self._token    = token
+        self._language = language
+        self._timeout  = timeout
+
+    def _url_and_headers(self) -> tuple[str, dict]:
+        import os
+        host  = (self._host or os.environ.get("DATABRICKS_HOST", "")).rstrip("/")
+        token = self._token or os.environ.get("DATABRICKS_TOKEN", "")
+        if not host:
+            raise RuntimeError("DatabricksASR: set DATABRICKS_HOST or pass host=")
+        if not token:
+            raise RuntimeError("DatabricksASR: set DATABRICKS_TOKEN or pass token=")
+        url = f"{host}/serving-endpoints/{self._endpoint}/invocations"
+        return url, {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    async def transcribe(self, audio_pcm: bytes, sample_rate: int = 16000) -> str:
+        import base64
+        import httpx
+        wav = pcm_to_wav(audio_pcm, sample_rate)
+        audio_b64 = base64.b64encode(wav).decode()
+        payload = {"inputs": [{"audio_b64": audio_b64, "language": self._language}]}
+        try:
+            url, headers = self._url_and_headers()
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                resp = await client.post(url, headers=headers, json=payload)
+            if resp.status_code == 200:
+                preds = resp.json().get("predictions", [])
+                return preds[0].get("text", "").strip() if preds else ""
+            logger.error("DatabricksASR HTTP %s: %s", resp.status_code, resp.text[:200])
+        except Exception as e:
+            logger.error("DatabricksASR error: %s", e)
+        return ""
+
+
+# ── Built-in: Databricks Model Serving TTS ────────────────────────────────────
+
+class DatabricksTTS(TTSProvider):
+    """TTS via a Databricks Model Serving endpoint (e.g. Kokoro TTS).
+
+    The endpoint must accept::
+
+        {"inputs": [{"text": "...", "speaker": "am_michael", "language": "en", "instruct": ""}]}
+
+    and return::
+
+        {"predictions": [{"audio_b64": "<base64-WAV>"}]}
+
+    Args:
+        endpoint: Serving endpoint name, e.g. ``"kokoro-tts"``.
+        host:     Databricks workspace URL. Reads ``DATABRICKS_HOST`` if omitted.
+        token:    Personal access token. Reads ``DATABRICKS_TOKEN`` if omitted.
+        speaker:  Speaker voice ID supported by the endpoint (e.g. ``"am_michael"``).
+        language: BCP-47 language code forwarded to the endpoint.
+        timeout:  HTTP timeout per sentence chunk in seconds.
+    """
+
+    def __init__(
+        self,
+        endpoint: str = "kokoro-tts",
+        host: str | None = None,
+        token: str | None = None,
+        speaker: str = "am_michael",
+        language: str = "en",
+        timeout: float = 15.0,
+    ):
+        self._endpoint = endpoint
+        self._host     = host
+        self._token    = token
+        self._speaker  = speaker
+        self._language = language
+        self._timeout  = timeout
+
+    def _url_and_headers(self) -> tuple[str, dict]:
+        import os
+        host  = (self._host or os.environ.get("DATABRICKS_HOST", "")).rstrip("/")
+        token = self._token or os.environ.get("DATABRICKS_TOKEN", "")
+        if not host:
+            raise RuntimeError("DatabricksTTS: set DATABRICKS_HOST or pass host=")
+        if not token:
+            raise RuntimeError("DatabricksTTS: set DATABRICKS_TOKEN or pass token=")
+        url = f"{host}/serving-endpoints/{self._endpoint}/invocations"
+        return url, {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    async def _synthesize_chunk(self, text: str) -> bytes | None:
+        import base64
+        import httpx
+        payload = {"inputs": [{"text": text, "speaker": self._speaker,
+                                "language": self._language, "instruct": ""}]}
+        try:
+            url, headers = self._url_and_headers()
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                resp = await client.post(url, headers=headers, json=payload)
+            if resp.status_code == 200:
+                preds = resp.json().get("predictions", [])
+                if preds:
+                    audio_b64 = preds[0].get("audio_b64") or preds[0].get("audio", "")
+                    if audio_b64:
+                        return base64.b64decode(audio_b64)
+            else:
+                logger.error("DatabricksTTS HTTP %s: %s", resp.status_code, resp.text[:200])
+        except Exception as e:
+            logger.error("DatabricksTTS error: %s", e)
+        return None
+
+    async def synthesize(self, text: str) -> list[bytes]:
+        if not text.strip():
+            return []
+        import asyncio
+        import re
+
+        # Split into sentence-sized chunks and synthesize concurrently.
+        parts = [s for s in re.split(r'(?<=[.!?])\s+', text.strip()) if s.strip()]
+        # Merge very short fragments to avoid tiny requests.
+        merged: list[str] = []
+        for p in parts:
+            if merged and len(merged[-1]) < 20:
+                merged[-1] += " " + p
+            else:
+                merged.append(p)
+
+        tasks = [asyncio.create_task(self._synthesize_chunk(s)) for s in merged]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        return [r for r in results if isinstance(r, bytes) and r]
 
 
 # ── Built-in: Echo (testing) ──────────────────────────────────────────────────

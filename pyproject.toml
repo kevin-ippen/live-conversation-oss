@@ -27,8 +27,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-openai = ["openai>=1.30"]
-dev    = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.4"]
+openai      = ["openai>=1.30"]
+databricks  = []  # no extra deps — httpx is already a core dep; just set DATABRICKS_HOST + DATABRICKS_TOKEN
+dev         = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.4"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
